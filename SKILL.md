@@ -167,3 +167,120 @@ ingress:
   # Catch-all (required)
   - service: http_status:404
 ```
+
+## 🔐 Access Policies via API
+
+### Créer une application Access protégée
+
+```bash
+ZONE_ID=$(cat ~/.config/cloudflare/zone_id)
+TOKEN=$(cat ~/.config/cloudflare/api_token)
+
+# Créer l'app Access
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Mon App",
+    "domain": "app.levier-ia.fr",
+    "type": "self_hosted",
+    "session_duration": "24h"
+  }'
+# Note l'ID de l'app retourné
+```
+
+### Ajouter une policy (email whitelist)
+
+```bash
+APP_ID="<app_id_from_above>"
+
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps/$APP_ID/policies" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Allowed users",
+    "decision": "allow",
+    "include": [
+      {"email": {"email": "contact@levier-ia.fr"}}
+    ]
+  }'
+```
+
+### Créer un bypass pour API (non_identity)
+
+```bash
+# Pour les endpoints API qui utilisent X-API-Key au lieu de login
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Mon App API",
+    "domain": "app.levier-ia.fr/api",
+    "type": "self_hosted"
+  }'
+
+# Puis ajouter policy bypass
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps/$APP_ID/policies" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "API Bypass",
+    "decision": "non_identity",
+    "include": [{"everyone": {}}]
+  }'
+```
+
+### Lister les apps Access
+
+```bash
+curl -s "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps" \
+  -H "Authorization: Bearer $TOKEN" | jq '.result[] | {id, name, domain}'
+```
+
+## 🚀 Workflow complet : Déployer un nouveau service
+
+```bash
+# Variables
+SUBDOMAIN="newapp"
+PORT="3000"
+ZONE_ID=$(cat ~/.config/cloudflare/zone_id)
+TOKEN=$(cat ~/.config/cloudflare/api_token)
+TUNNEL_ID="b2e091ec-d3c8-41c3-85b6-2d6a695e8dee"
+
+# 1. Ajouter au tunnel config
+echo "  - hostname: ${SUBDOMAIN}.levier-ia.fr
+    service: http://localhost:${PORT}" >> ~/.cloudflared/config.yml
+
+# 2. Créer DNS record
+cloudflared tunnel route dns $TUNNEL_ID ${SUBDOMAIN}.levier-ia.fr
+
+# 3. Restart tunnel
+pkill cloudflared
+nohup cloudflared tunnel --config ~/.cloudflared/config.yml run > /tmp/cloudflared.log 2>&1 &
+
+# 4. Créer Access app (protégé par email)
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"name\": \"${SUBDOMAIN}\",
+    \"domain\": \"${SUBDOMAIN}.levier-ia.fr\",
+    \"type\": \"self_hosted\",
+    \"session_duration\": \"730h\"
+  }"
+
+# 5. Ajouter policy email
+APP_ID=$(curl -s "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps" \
+  -H "Authorization: Bearer $TOKEN" | jq -r ".result[] | select(.domain==\"${SUBDOMAIN}.levier-ia.fr\") | .id")
+
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/access/apps/$APP_ID/policies" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Allowed users",
+    "decision": "allow",
+    "include": [{"email": {"email": "contact@levier-ia.fr"}}]
+  }'
+
+echo "✅ https://${SUBDOMAIN}.levier-ia.fr deployed!"
+```
